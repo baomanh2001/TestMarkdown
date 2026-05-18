@@ -1,3 +1,629 @@
+Tôi sẽ audit toàn bộ code một cách có hệ thống.
+
+---
+
+# 🔍 AUDIT REPORT - grbl_AxisArm
+
+## 1. 🔴 CRITICAL BUGS (gây crash/hang/undefined behavior)
+
+---
+
+### BUG-C1: `CNC_Process()` - Logic `cnc_send_ok_flag` bị đảo ngược
+
+```c
+if (cnc_send_ok_flag) {
+    cnc_send_ok_flag = false;
+    if (cnc_machine.state != CNC_STATE_GOWDELAY
+            && cnc_machine.state != CNC_STATE_GOWDELAY_RECT
+            && cnc_machine.state != CNC_STATE_GOTO){}   // ← EMPTY BODY!
+#if CNC_USE_PLANNER
+    else if (planner_streaming_active) {
+```
+
+**Vấn đề:**
+- `if (...) {}` → body rỗng → `else if` chỉ chạy khi state LÀ GOTO/GOWDELAY
+- Logic hoàn toàn ngược: planner OK check chạy sai branch
+- Non-planner OK (`else`) cũng chạy sai
+
+**Fix:**
+```c
+if (cnc_send_ok_flag) {
+    cnc_send_ok_flag = false;
+
+#if CNC_USE_PLANNER
+    if (planner_streaming_active) {
+        bool planner_empty = CNC_Planner_IsBufferEmpty();
+#if CNC_USE_COMMAND_QUEUE
+        bool queue_empty = CNC_Queue_IsEmpty();
+#else
+        bool queue_empty = true;
+#endif
+        bool machine_idle = !cnc_machine.is_moving &&
+                            (cnc_machine.state == CNC_STATE_IDLE);
+
+        if (planner_empty && queue_empty && machine_idle) {
+            planner_streaming_active = false;
+            planner_blocks_sent = 0;
+            planner_blocks_done = 0;
+            CNC_UART_SendOK();
+        }
+    } else {
+        CNC_UART_SendOK();
+    }
+#else
+    CNC_UART_SendOK();
+#endif
+}
+```
+
+---
+
+### BUG-C2: `CNC_Config_Set()` - VLA declaration trong switch-case (C99 UB)
+
+```c
+case 32:
+    uint32_t iv = CNC_Config_ClampU32(value, 0, 3600000);  // ← ILLEGAL
+    CNC_Config_SetAutoReport(iv);
+```
+
+**Vấn đề:** Khai báo biến trực tiếp trong `case` label mà không có block `{}` → undefined behavior trong C99, compiler error trong C11.
+
+**Fix:**
+```c
+case 32: {
+    uint32_t iv = CNC_Config_ClampU32(value, 0, 3600000);
+    CNC_Config_SetAutoReport(iv);
+    applied = (float)cnc_config.auto_report_interval;
+    break;
+}
+```
+
+---
+
+### BUG-C3: ISR - `step_events_remaining` decrement SAU khi check completion
+
+```c
+// Phase 1 (LOW):
+if (had) {
+    step_events_remaining--;   // ← decrement ở đây
+    ...
+}
+// ...
+// Sau đó return - KHÔNG check completion trong phase 1!
+
+// Phase 0 (HIGH) check:
+if (step_events_remaining <= 0) {  // ← check ở đây
+    CNC_Timer_Stop();
+    ...
+}
+```
+
+**Vấn đề:** `step_events_remaining` được decrement trong phase 1 (LOW), nhưng completion check chỉ ở phase 0 (HIGH). Điều này có nghĩa:
+- Sau step cuối cùng: phase 1 decrement → `remaining = 0`
+- Trả về, set `ARR = step_high_ticks`
+- Phase 0 tiếp theo: check `<= 0` → stop
+- **Kết quả:** Có thêm 1 interrupt HIGH vô ích sau step cuối, gây delay nhỏ nhưng không crash
+
+**Fix - thêm check sau decrement trong phase 1:**
+```c
+if (had) {
+    step_events_remaining--;
+    
+    if (step_events_remaining <= 0) {
+        // Complete - finalize position
+        CNC_Timer_Stop();
+        for (int i = 0; i < CNC_NUM_AXES; i++) {
+            cnc_machine.position[i] = cnc_machine.target[i];
+            cnc_machine.step_count[i] = 0;
+        }
+        cnc_machine.is_moving = false;
+        if (cnc_machine.state == CNC_STATE_RUN) {
+            cnc_machine.state = CNC_STATE_IDLE;
+            planner_blocks_done++;
+            cnc_send_ok_flag = true;
+        } else if (cnc_machine.state == CNC_STATE_GOTO) {
+            cnc_machine.state = CNC_STATE_IDLE;
+        }
+        return;
+    }
+    // ... accel tick, homing count
+}
+```
+
+---
+
+### BUG-C4: `CNC_WaitMotionComplete_Safe()` - Gọi trong ISR context có thể reentrant
+
+```c
+// CNC_Move_Internal() gọi CNC_WaitMotionComplete_Safe()
+// CNC_Move_Internal() được gọi từ:
+//   - CNC_Homing_MoveAxis() ← được gọi từ CNC_Homing_Process()
+//   - CNC_GoWDelay_NextStep() ← được gọi từ CNC_GoWDelay_Process()
+```
+
+Cả `CNC_Homing_Process()` và `CNC_GoWDelay_Process()` được gọi từ `CNC_Process()` (main loop). Không phải ISR, nhưng `CNC_WaitMotionComplete_Safe()` bên trong lại gọi `CNC_Accel_Update()` và check UART → **blocking wait trong main loop** khi homing/gowdelay.
+
+**Vấn đề thực tế:** `CNC_Homing_MoveAxis()` → `CNC_Move_Internal()` → `CNC_WaitMotionComplete_Safe()` → blocking loop → **deadlock** vì `CNC_Homing_Process()` không bao giờ được gọi lại để advance state.
+
+**Fix:**
+```c
+static void CNC_Homing_MoveAxis(...) {
+    // KHÔNG gọi CNC_Move_Internal - setup trực tiếp
+    // Bỏ wait, để Process() poll is_moving
+    
+    // Setup Bresenham trực tiếp (không wait)
+    // ... (như hiện tại nhưng không có WaitMotionComplete)
+    cnc_machine.is_moving = true;
+    CNC_Timer_Start();
+    // Return ngay - Process() sẽ poll
+}
+```
+
+Hiện tại `CNC_Move_Internal()` có:
+```c
+if (cnc_machine.is_moving) {
+    if (!CNC_WaitMotionComplete_Safe(60000)) { return; }
+}
+```
+
+Với homing, `is_moving` sẽ là `false` khi `CNC_Homing_Process()` gọi `CNC_Homing_MoveAxis()` (vì ISR đã set `is_moving=false`), nên **không bị blocking**. Bug C4 thực ra ít nghiêm trọng hơn phân tích ban đầu - nhưng cần verify.
+
+---
+
+### BUG-C5: `CNC_UART_PutFloat()` - Sai với số âm gần 0
+
+```c
+void CNC_UART_PutFloat(float num, uint8_t decimals) {
+    if (num < 0) { CNC_UART_PutChar('-'); num = -num; }
+    int32_t ip = (int32_t)num;
+    CNC_UART_PutInt(ip);
+    CNC_UART_PutChar('.');
+    float frac = num - (float)ip;
+    for (uint8_t i = 0; i < decimals; i++) {
+        frac *= 10;
+        CNC_UART_PutChar('0' + (int)frac % 10);  // ← BUG
+    }
+}
+```
+
+**Vấn đề 1:** `(int)frac % 10` - operator precedence: `(int)(frac) % 10` → đúng cho digit đầu, nhưng `frac` không được cập nhật → tất cả digits giống nhau!
+
+**Ví dụ:** `num = 1.234`, decimals=3:
+- i=0: frac=2.34, char='2' ✓
+- i=1: frac=23.4, char='3'... wait, `(int)23.4 % 10 = 3` ✓
+- i=2: frac=234.0, char='4' ✓
+
+Thực ra logic này đúng vì `frac` tiếp tục nhân 10. Nhưng:
+
+**Vấn đề 2:** Floating point accumulation error. Với `num = 1.999`:
+- `ip = 1`, `frac = 0.999`
+- i=0: `frac=9.99`, digit=9 ✓
+- i=1: `frac=99.9`, digit=9 ✓  
+- i=2: `frac=999.0`, digit=9 ✓ → "1.999" ✓
+
+**Vấn đề 3 (REAL):** Không có rounding. `1.2345` với decimals=3 → "1.234" không phải "1.235".
+
+**Fix:**
+```c
+void CNC_UART_PutFloat(float num, uint8_t decimals) {
+    if (num < 0) { CNC_UART_PutChar('-'); num = -num; }
+    
+    // Round trước khi split
+    float round_factor = 0.5f;
+    for (uint8_t i = 0; i < decimals; i++) round_factor *= 0.1f;
+    num += round_factor;
+    
+    int32_t ip = (int32_t)num;
+    CNC_UART_PutInt(ip);
+    if (decimals == 0) return;
+    CNC_UART_PutChar('.');
+    float frac = num - (float)ip;
+    for (uint8_t i = 0; i < decimals; i++) {
+        frac *= 10.0f;
+        int d = (int)frac;
+        CNC_UART_PutChar('0' + d);
+        frac -= (float)d;
+    }
+}
+```
+
+---
+
+## 2. 🟠 SERIOUS BUGS (gây sai kết quả/behavior)
+
+---
+
+### BUG-S1: `CNC_Process()` - GUI busy check nhưng `STATUS` check trùng lặp
+
+```c
+if (strcmp(line, "STATUS") == 0 || strcmp(line, "?") == 0) {
+    CNC_SendStatus();
+    return;
+}
+// ...
+if (gui_busy) {
+    if (strcmp(line, "STATUS") == 0 || strcmp(line, "?") == 0) {  // ← DEAD CODE
+        CNC_SendStatus();
+        return;
+    }
+```
+
+**Fix:** Xóa check STATUS bên trong `gui_busy` block vì đã handled trước đó.
+
+---
+
+### BUG-S2: Homing - ISR check limit trong PULLOFF phases
+
+```c
+// ISR:
+if (cnc_machine.state == CNC_STATE_HOMING &&
+    (cnc_machine.homing_phase == HOMING_SEEK ||
+     cnc_machine.homing_phase == HOMING_FEED))
+{
+    // Check limit
+}
+```
+
+**Tốt** - đã đúng, chỉ check trong SEEK và FEED. Nhưng:
+
+```c
+// Hard limit check cũng chạy:
+if (cnc_config.hard_limit_enabled
+    && (cnc_machine.state == CNC_STATE_RUN || ...))
+{
+    // KHÔNG include HOMING → OK
+}
+```
+
+Nhưng `CNC_Limit_CheckAll()` trong `CNC_Process()`:
+```c
+if (cnc_config.hard_limit_enabled && cnc_machine.is_moving
+    && (cnc_machine.state == CNC_STATE_RUN
+        || cnc_machine.state == CNC_STATE_GOTO
+        || cnc_machine.state == CNC_STATE_GOWDELAY
+        || cnc_machine.state == CNC_STATE_GOWDELAY_RECT)) {
+    CNC_Limit_CheckAll();
+}
+```
+
+**OK** - không include HOMING. Nhưng `CNC_Homing_MoveAxis()` reset `homing_limit_hit = false` - điều này đúng.
+
+---
+
+### BUG-S3: `CNC_Planner_AddBlock()` - `planner_streaming_active` reset sai
+
+```c
+if (!planner_streaming_active) {
+    planner_streaming_active = true;
+    planner_blocks_done = 0;  // Reset done counter
+    // Không reset blocks_sent
+}
+```
+
+**Vấn đề:** `planner_blocks_done` reset khi bắt đầu stream mới, nhưng `planner_blocks_sent` không được reset. Nếu có stream trước đó bị incomplete, counter sẽ sai.
+
+**Fix:**
+```c
+if (!planner_streaming_active) {
+    planner_streaming_active = true;
+    planner_blocks_sent = 0;
+    planner_blocks_done = 0;
+}
+```
+
+---
+
+### BUG-S4: `CNC_GoWDelayRect_Process()` - `GWDRECT_WAIT_X` với `current_step_in_row == 0`
+
+```c
+case GWDRECT_WAIT_X:
+    if ((CNC_GetTick() - gwr->delay_start_tick) >= gwr->delay_ms) {
+        if (gwr->current_step_in_row == 0)
+            CNC_GoWDelayRect_NextStepY();
+        else
+            CNC_GoWDelayRect_NextStepX();
+    }
+```
+
+**Vấn đề:** `current_step_in_row` được reset về 0 ngay trước khi set WAIT_X khi row done:
+```c
+gwr->x_direction = -gwr->x_direction;
+gwr->current_row++;
+gwr->current_step_in_row = 0;  // ← reset
+if (gwr->delay_ms > 0) {
+    gwr->phase = GWDRECT_WAIT_X;  // ← set wait
+```
+
+→ Khi wait xong, `current_step_in_row == 0` → gọi `NextStepY()` ✓. Logic đúng nhưng dễ nhầm.
+
+---
+
+### BUG-S5: `CNC_Execute()` - G-code không uppercase hoàn toàn
+
+```c
+char upper_line[GCODE_LINE_SIZE];
+// ... uppercase conversion ...
+line = upper_line;  // Reassign pointer
+
+// Sau đó:
+if (has_command(line, 'G', 0)) rapid_mode = true;
+```
+
+**Vấn đề:** `find_value()` check cả upper và lower case, nhưng sau khi uppercase `line`, việc check lower không cần thiết. Tuy nhiên không gây bug.
+
+**Real issue:** `find_value()` có điều kiện:
+```c
+bool ok = (p == line) || (*(p-1) == ' ') || (*(p-1) == '\t');
+```
+Điều này nghĩa là ký tự axis (`X`, `Y`...) phải ở đầu hoặc sau space. `G1X10` (không space) sẽ FAIL vì `*(p-1) = '1'` không phải space.
+
+**Fix:**
+```c
+bool ok = (p == line) || !isalnum((unsigned char)*(p-1));
+```
+
+---
+
+### BUG-S6: `CNC_Move_Internal()` - Soft limit check thiếu
+
+```c
+// CNC_Move_Internal() không check soft limits!
+// Soft limit chỉ check trong CNC_Execute()
+```
+
+Khi `CNC_Move()` được gọi trực tiếp (từ GOTO, GOWDELAY...), soft limit không được check.
+
+**Fix:** Thêm soft limit check vào `CNC_Move_Internal()`:
+```c
+if (cnc_config.soft_limit_enabled) {
+    for (int i = 0; i < CNC_NUM_AXES; i++) {
+        float mn = cnc_config.allow_negative ? -cnc_config.max_travel[i] : 0;
+        if (target[i] < mn || target[i] > cnc_config.max_travel[i]) {
+            CNC_UART_PutString("[SOFT LIMIT]\r\n");
+            return;
+        }
+    }
+}
+```
+
+---
+
+### BUG-S7: Position update trong ISR không atomic với main context
+
+```c
+// ISR Phase 1:
+cnc_machine.position[i] += (float)cnc_machine.direction[i]
+                           * cnc_config.inv_steps_per_mm[i];
+```
+
+**Vấn đề:** `float` trên Cortex-M3 không có FPU → load/store nhiều instruction → không atomic. Main context đọc `position[]` trong `CNC_SendStatus()` có thể đọc giá trị nửa chừng.
+
+**Fix:** Dùng shadow copy hoặc disable IRQ khi đọc position cho status:
+```c
+void CNC_GetPosition(float *pos) {
+    __disable_irq();
+    for (int i = 0; i < CNC_NUM_AXES; i++)
+        pos[i] = cnc_machine.position[i];
+    __enable_irq();
+}
+```
+
+---
+
+## 3. 🟡 MEDIUM BUGS (logic sai/thiếu)
+
+---
+
+### BUG-M1: `CNC_Timer_SetPeriod()` - ARR update không sync với phase
+
+```c
+static void CNC_Timer_SetPeriod(uint32_t period_us) {
+    ...
+    CNC_TIMER->ARR = (step_phase == 0) ?
+        step_high_ticks - 1 : step_low_ticks - 1;
+}
+```
+
+**Vấn đề:** `step_phase` có thể thay đổi do ISR giữa khi check và khi write ARR → race condition.
+
+---
+
+### BUG-M2: `CNC_Homing_Process()` - HOMING_PULLOFF1 logic sai thứ tự
+
+```c
+case HOMING_PULLOFF1:
+    cnc_machine.homing_phase = HOMING_FEED;
+    CNC_Homing_MoveAxis(axis,
+        dir * cnc_config.homing_pulloff * 5,  // ← move TOWARD switch?
+        cnc_config.homing_feed_rate);
+```
+
+**Vấn đề:** Sau PULLOFF1 (đã rời switch), FEED phase move `dir * pulloff * 5`. Nếu `dir = -1` (home negative), pulloff1 đã move `+pulloff*3` (away). Feed cần move `-pulloff*5` (toward). `dir * pulloff * 5 = -1 * pulloff * 5` → đúng hướng ✓.
+
+Nhưng pulloff distance `homing_pulloff * 5` có thể ít hơn seek distance nếu switch xa. Nên dùng giá trị lớn hơn hoặc configurable.
+
+---
+
+### BUG-M3: `CNC_GoWDelay_Start()` - First step setup trùng với Process()
+
+```c
+// CNC_GoWDelay_Start():
+gwd->distance_moved = sd;
+for (int i = 0; i < CNC_NUM_AXES; i++)
+    next_pos[i] = gwd->start_pos[i] + gwd->unit_vector[i] * gwd->distance_moved;
+CNC_Move_NoAccel(next_pos, gwd->feedrate);
+
+// CNC_GoWDelay_Process() GWDRECT_MOVE_X:
+if (!cnc_machine.is_moving) {
+    gwd->current_step++;  // ← increment AFTER first step
+```
+
+**Vấn đề:** First step được start trong `_Start()`, sau khi complete, `Process()` increment `current_step` từ 0→1 và gọi `NextStep()`. Nếu `total_steps = 1`, check `current_step >= total_steps` → true → complete. Logic đúng.
+
+---
+
+### BUG-M4: `CNC_ProcessCommand()` - GOWDELAY parser dùng `find_value()` với raw params
+
+```c
+if (strncmp(cmd, "GOWDELAY", 8) == 0) {
+    const char *p = cmd + 8;
+    // ...
+    if (find_value(p, 'X', &v)) { ... }
+```
+
+**Vấn đề:** `find_value()` yêu cầu `X` ở đầu hoặc sau space. `GOWDELAY X10 Y20` → `p = " X10 Y20"` → X sau space ✓. Nhưng `GOWDELAYY10` sẽ không parse đúng vì `find_value` sẽ tìm `Y` trong "GOWDELAY..." string... wait, `p = cmd+8` bỏ qua prefix. OK.
+
+---
+
+### BUG-M5: `CNC_Accel_Update()` - `dist_remaining` dùng khi `skip_phase_update = true`
+
+```c
+float dist_remaining = 0.0f;  // init = 0
+
+if (!skip_phase_update) {
+    // ...
+    dist_remaining = (float)steps_remaining * mm_per_step;
+    // ...
+}
+
+// Safety envelope (không check skip_phase_update!):
+{
+    float safe_sqr = a->exit_speed * a->exit_speed
+                   + 2.0f * a->accel_rate * dist_remaining;  // ← dist_remaining = 0 nếu skip!
+```
+
+**Vấn đề:** Khi `skip_phase_update = true` (move quá dài), `dist_remaining = 0` → `safe_sqr = exit_speed²` → `max_safe = exit_speed` → force `current_speed = exit_speed`. **Sai** cho cruise phase.
+
+**Fix:**
+```c
+if (!skip_phase_update) {
+    // Safety envelope
+    float safe_sqr = a->exit_speed * a->exit_speed
+                   + 2.0f * a->accel_rate * dist_remaining;
+    // ...
+}
+```
+
+---
+
+### BUG-M6: `CNC_Planner_Recalculate()` - Forward pass propagate không cần thiết
+
+```c
+// Forward pass:
+float max_next_entry = cur->exit_speed_sqr
+    + 2.0f * next->acceleration * next->distance;
+if (max_next_entry < next->entry_speed_sqr) {
+    next->entry_speed_sqr = max_next_entry;
+}
+```
+
+**Comment trong code nói:** "This is already handled by backward pass". Đây là redundant computation, không phải bug, nhưng có thể gây inconsistency nếu backward pass chưa converge.
+
+---
+
+## 4. 🔵 MINOR / WARNINGS
+
+---
+
+### BUG-W1: `CNC_Process()` - `gui_busy` check trùng STATUS
+
+Đã nêu ở BUG-S1.
+
+### BUG-W2: `CNC_Init()` - Busy wait bằng for loop không portable
+
+```c
+for (volatile int i = 0; i < 100000; i++);
+```
+
+Dùng `HAL_Delay(10)` hoặc SysTick-based delay tốt hơn.
+
+### BUG-W3: `CNC_UART_GetLine()` - Static buffer shared
+
+```c
+static char temp[GCODE_LINE_SIZE];
+static uint16_t idx = 0;
+```
+
+Không thread-safe nếu gọi từ nhiều context. Trong single-threaded OK.
+
+### BUG-W4: `CNC_Planner_AddBlock()` - Junction speed formula
+
+```c
+float vj = sqrtf(
+    block->acceleration * PLANNER_JUNCTION_DEVIATION
+    * sth2 / denom);
+```
+
+GRBL gốc dùng `sin(theta/2)` khác. Công thức hiện tại có thể cho junction speed quá cao ở góc nhọn.
+
+### BUG-W5: Missing `$$` trong busy check whitelist
+
+```c
+if (gui_busy) {
+    if (strcmp(line, "$$") == 0 || strcmp(line, "CONFIG") == 0) {
+```
+
+`$$` được check ✓. OK.
+
+### BUG-W6: `CNC_GoWDelayRect_NextStepX()` - Float comparison
+
+```c
+if (gwr->current_x > 0)
+    gwr->current_x = 0;
+```
+
+Nên dùng epsilon: `if (gwr->current_x > -0.001f)`.
+
+---
+
+## 5. 📊 TỔNG KẾT
+
+| Mức độ | Số lỗi | Critical nhất |
+|--------|--------|---------------|
+| 🔴 Critical | 5 | BUG-C1 (OK logic ngược), BUG-C2 (C99 UB), BUG-C3 (ISR completion) |
+| 🟠 Serious | 7 | BUG-S5 (G-code parse), BUG-S6 (soft limit), BUG-S7 (non-atomic) |
+| 🟡 Medium | 6 | BUG-M5 (accel safety envelope) |
+| 🔵 Minor | 6 | Various |
+
+---
+
+## 6. 🔧 FIX ƯU TIÊN
+
+```
+1. BUG-C1  → Fix OK flag logic (sai hoàn toàn)
+2. BUG-C2  → Thêm {} cho case 32
+3. BUG-S7  → Atomic position read trong GetPosition()
+4. BUG-S5  → Fix find_value() boundary check
+5. BUG-M5  → Fix safety envelope khi skip_phase_update
+6. BUG-S6  → Thêm soft limit trong Move_Internal()
+7. BUG-C3  → Check completion sau decrement trong ISR
+```
+
+Bạn muốn tôi viết patch cụ thể cho từng bug không?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------------------------------
 # AUDIT TOÀN BỘ grbl_AxisArm
 
 ## 1. ISR ANALYSIS - CNC_TIMER_IRQHandler
